@@ -103,6 +103,8 @@ class WhoopConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler):
         api_client = WhoopApiClient(session, access_token)
 
         entry_title_name_part = "User"
+        existing_entry = None
+        user_id = None
 
         try:
             profile = await api_client.get_user_profile_basic()
@@ -116,14 +118,30 @@ class WhoopConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler):
                     entry_title_name_part = f"User {user_id}"
 
                 if user_id:
-                    await self.async_set_unique_id(str(user_id))
-                    self._abort_if_unique_id_configured(updates=data)
+                    existing_entry = await self.async_set_unique_id(str(user_id))
+                    if self.source != config_entries.SOURCE_REAUTH:
+                        self._abort_if_unique_id_configured(updates=data)
             else:
                 _LOGGER.warning("Could not fetch WHOOP profile to set a dynamic title.")
         except Exception as e:
             _LOGGER.error("Error fetching WHOOP profile for dynamic title: %s", e)
 
         entry_title = f"{entry_title_name_part}'s WHOOP"
+        if self.source == config_entries.SOURCE_REAUTH:
+            entry = self._get_reauth_entry()
+            if (
+                user_id
+                and existing_entry is not None
+                and existing_entry.entry_id != entry.entry_id
+            ):
+                return self.async_abort(reason="already_configured")
+            return self.async_update_reload_and_abort(
+                entry,
+                unique_id=str(user_id) if user_id else entry.unique_id,
+                title=entry_title,
+                data=data,
+            )
+
         _LOGGER.info("Creating config entry with title '%s'", entry_title)
         return self.async_create_entry(
             title=entry_title,
