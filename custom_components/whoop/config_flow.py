@@ -103,44 +103,63 @@ class WhoopConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler):
         api_client = WhoopApiClient(session, access_token)
 
         entry_title_name_part = "User"
-        existing_entry = None
         user_id = None
 
+        # Only data-fetch failures should be swallowed here; control-flow
+        # exceptions (e.g. AbortFlow from the unique_id checks below) must be
+        # raised outside this try so they are not silently logged and ignored.
         try:
             profile = await api_client.get_user_profile_basic()
-            if profile:
-                user_id = profile.get("user_id")
-                first_name = profile.get("first_name")
-
-                if first_name:
-                    entry_title_name_part = first_name
-                elif user_id:
-                    entry_title_name_part = f"User {user_id}"
-
-                if user_id:
-                    existing_entry = await self.async_set_unique_id(str(user_id))
-                    if self.source != config_entries.SOURCE_REAUTH:
-                        self._abort_if_unique_id_configured(updates=data)
-            else:
-                _LOGGER.warning("Could not fetch WHOOP profile to set a dynamic title.")
-        except Exception as e:
+        except Exception as e:  # broad on purpose: never block auth on a profile hiccup
             _LOGGER.error("Error fetching WHOOP profile for dynamic title: %s", e)
+            profile = None
+
+        if profile:
+            user_id = profile.get("user_id")
+            first_name = profile.get("first_name")
+            if first_name:
+                entry_title_name_part = first_name
+            elif user_id:
+                entry_title_name_part = f"User {user_id}"
+        else:
+            _LOGGER.warning("Could not fetch WHOOP profile to set a dynamic title.")
 
         entry_title = f"{entry_title_name_part}'s WHOOP"
+
         if self.source == config_entries.SOURCE_REAUTH:
-            entry = self._get_reauth_entry()
-            if (
-                user_id
-                and existing_entry is not None
-                and existing_entry.entry_id != entry.entry_id
+            reauth_entry = self._get_reauth_entry()
+            # Refuse to persist the new token unless we can confirm which WHOOP
+            # account it belongs to - otherwise a failed/unauthorized profile
+            # fetch would store an unverified token and loop on reauth.
+            if not user_id:
+                _LOGGER.error(
+                    "Reauth aborted: could not identify the WHOOP account for the new token."
+                )
+                return self.async_abort(reason="reauth_unsuccessful")
+            existing_entry = await self.async_set_unique_id(str(user_id))
+            if reauth_entry.unique_id is not None:
+                # Block rebinding this entry to a different WHOOP account
+                # (whether or not that account is configured elsewhere).
+                self._abort_if_unique_id_mismatch(reason="wrong_account")
+            elif (
+                existing_entry is not None
+                and existing_entry.entry_id != reauth_entry.entry_id
             ):
-                return self.async_abort(reason="already_configured")
+                # Legacy entry that never got a unique_id, but the resolved
+                # account already belongs to another entry - avoid duplicating it.
+                return self.async_abort(reason="wrong_account")
+            # Heals a legacy entry with no unique_id by adopting the resolved one;
+            # a no-op when it already matches.
             return self.async_update_reload_and_abort(
-                entry,
-                unique_id=str(user_id) if user_id else entry.unique_id,
+                reauth_entry,
+                unique_id=str(user_id),
                 title=entry_title,
                 data=data,
             )
+
+        if user_id:
+            await self.async_set_unique_id(str(user_id))
+            self._abort_if_unique_id_configured(updates=data)
 
         _LOGGER.info("Creating config entry with title '%s'", entry_title)
         return self.async_create_entry(

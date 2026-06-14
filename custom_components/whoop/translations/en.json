@@ -8,6 +8,11 @@
         "title": "Reauthenticate WHOOP",
         "description": "Please reauthenticate with your WHOOP account."
       }
+    },
+    "abort": {
+      "reauth_successful": "Re-authentication was successful",
+      "reauth_unsuccessful": "Re-authentication failed: could not verify your WHOOP account. Please try again.",
+      "wrong_account": "The authorized WHOOP account does not match this entry. Reauthenticate with the original account, or remove this entry and add the other account separately."
     }
   },
   "options": {
