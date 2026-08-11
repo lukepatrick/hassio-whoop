@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 
 from aiohttp import ClientError, ClientResponseError, ClientSession
 
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import (
@@ -23,6 +23,24 @@ _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 15
 CLIENT_VERSION = "0.1.0"
+
+
+class WhoopUnauthorized(HomeAssistantError):
+    """WHOOP rejected the access token with HTTP 401.
+
+    Deliberately NOT an UpdateFailed: the per-endpoint get_* helpers below
+    swallow UpdateFailed and return None, and a 401 must reach the coordinator
+    so it can force a token refresh.
+
+    Deliberately NOT a ConfigEntryAuthFailed either. That is terminal - core
+    only re-arms the poll timer `if not auth_failed`
+    (helpers/update_coordinator.py), so raising it stops the coordinator for
+    good and the integration sits dead until a human intervenes. WHOOP has been
+    observed rejecting an access token that Home Assistant still considered
+    valid, which a refresh recovers; escalating straight to reauth turns a
+    two-minute blip into a multi-hour outage. async_update_data decides when a
+    401 is genuinely fatal.
+    """
 
 
 class WhoopApiClient:
@@ -75,8 +93,11 @@ class WhoopApiClient:
                 response_text_for_error,
             )
             if err.status == 401:
-                raise ConfigEntryAuthFailed(
-                    f"Authentication failed: {err.message}"
+                # Carry the response body through: it is the only record of what
+                # WHOOP actually said, and home-assistant.log rotates quickly.
+                raise WhoopUnauthorized(
+                    f"401 from {path}: "
+                    f"{response_text_for_error.strip() or err.message}"
                 ) from err
             if err.status == 429:
                 raise UpdateFailed(f"Rate limit exceeded: {err.message}") from err
