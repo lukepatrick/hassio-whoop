@@ -41,10 +41,7 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = ["sensor"]
 SCAN_INTERVAL = timedelta(minutes=2)
 
-# How long to keep retrying after a 401 - forcing exactly one token refresh -
-# before giving up and asking the user to reauthenticate. Every WHOOP 401
-# observed so far has been recoverable by refreshing, so ride out transients
-# rather than demanding browser consent on the first failure.
+# Retry a 401 for this long (forcing one token refresh) before demanding reauth.
 AUTH_RETRY_WINDOW = timedelta(minutes=15)
 
 
@@ -96,16 +93,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.error("Initial token validation failed: %s", err)
         raise
     except OAuth2TokenRequestReauthError as err:
-        # 4xx from the token endpoint: the grant itself is dead and only the
-        # user can fix it. (Subclass of OAuth2TokenRequestError - must be caught
-        # before it.)
+        # 4xx from the token endpoint: the grant is dead. Must precede the catch
+        # below - it is a subclass of OAuth2TokenRequestError.
         _LOGGER.error("WHOOP rejected the stored refresh token: %s", err)
         raise ConfigEntryAuthFailed("WHOOP rejected the refresh token") from err
     except (OAuth2TokenRequestError, ClientError, asyncio.TimeoutError) as err:
-        # 429/5xx, or a raw network failure - LocalOAuth2Implementation._token_request
-        # only wraps ClientResponseError, so plain network errors arrive unwrapped.
-        # All recoverable: retry with backoff rather than demanding that the user
-        # re-consent in a browser because WHOOP was briefly unreachable.
+        # 429/5xx and network failures are recoverable. _token_request only wraps
+        # ClientResponseError, so raw network errors arrive unwrapped.
         raise ConfigEntryNotReady(
             f"Could not reach the WHOOP token endpoint: {err}"
         ) from err
@@ -117,22 +111,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async_get_clientsession(hass), oauth_session.token["access_token"]
     )
 
-    # Tracks an in-flight 401 recovery: when the episode started (monotonic) and
-    # whether a token refresh has already been forced for it.
+    # In-flight 401 recovery state, reset on the next successful update.
     auth_state: Dict[str, Any] = {"since": None, "refresh_forced": False}
 
     def _invalidate_access_token() -> None:
-        """Expire the stored access token so the next cycle forces a refresh.
+        """Expire the stored token so the next cycle refreshes it.
 
-        OAuth2Session.async_ensure_token_valid() short-circuits while expires_at
-        is in the future, so a 401 against a locally-valid access token is
-        otherwise unrecoverable. Zeroing expires_at makes the next call refresh -
-        and it does so under OAuth2Session's own _token_lock, which keeps
-        concurrent refreshes of WHOOP's rotating refresh token impossible.
-
-        The token dict is rebuilt, not mutated in place: async_update_entry()
-        bails out on `entry.data != data`, so mutating the nested dict compares
-        equal and is silently never persisted.
+        async_ensure_token_valid() short-circuits while expires_at is in the
+        future, so a 401 against a locally-valid token is otherwise
+        unrecoverable. Rebuild the dict rather than mutating it -
+        async_update_entry() compares `entry.data != data` and would otherwise
+        persist nothing.
         """
         token = entry.data.get("token")
         if not token or token.get("expires_at") == 0:
@@ -142,13 +131,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     def _handle_unauthorized(err: WhoopUnauthorized) -> None:
-        """Decide what a 401 means. Always raises.
+        """Force one refresh, retry for AUTH_RETRY_WINDOW, then escalate.
 
-        First 401 of an episode: force a refresh and keep the coordinator alive.
-        Still failing afterwards: retry quietly until AUTH_RETRY_WINDOW elapses,
-        then escalate to reauth. Raising ConfigEntryAuthFailed immediately would
-        be wrong - core stops the coordinator permanently on auth failure, so a
-        recoverable 401 would strand the integration until a human noticed.
+        Always raises. Escalating on the first 401 would be wrong: core stops
+        the coordinator permanently on auth failure.
         """
         now = time.monotonic()
         if auth_state["since"] is None:
@@ -159,8 +145,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             auth_state["refresh_forced"] = True
             token = entry.data.get("token") or {}
             expires_at = token.get("expires_at")
-            # Deliberately WARNING, not debug: this is the only record of the
-            # condition, and home-assistant.log rotates within hours.
             _LOGGER.warning(
                 "WHOOP returned 401 while the stored access token was still "
                 "considered valid (expires_at=%s, ~%s s remaining). Forcing a "
@@ -227,11 +211,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 result_item = results[i]
                 if isinstance(result_item, Exception):
                     if isinstance(result_item, WhoopUnauthorized):
-                        # All six calls share one access token, so a dead token
-                        # produces six identical 401s. Keep the first and handle
-                        # it once, after the loop - never per-endpoint, or we
-                        # would fire six concurrent refreshes of a rotating
-                        # refresh token and risk WHOOP revoking the whole grant.
+                        # Handle once, after the loop: six concurrent refreshes
+                        # of a rotating refresh token risks revoking the grant.
                         unauthorized = unauthorized or result_item
                         continue
                     _LOGGER.error("Error fetching %s: %s", key, result_item)
@@ -268,14 +249,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.error("UpdateFailed during WHOOP data update: %s", err)
             raise
         except OAuth2TokenRequestError:
-            # Raised by the OAuth helper when the *token request itself* fails.
-            # Core's coordinator classifies these natively
-            # (helpers/update_coordinator.py): OAuth2TokenRequestReauthError
-            # starts a reauth flow, transient 429/5xx keep polling. It is NOT a
-            # ConfigEntryAuthFailed (it subclasses ClientResponseError, not
-            # IntegrationError), so the blanket handler below would otherwise
-            # swallow it into UpdateFailed - hiding a genuinely revoked grant
-            # behind an infinite retry loop that never prompts the user.
+            # Core's coordinator classifies these itself. Must precede the
+            # blanket handler, which would bury a revoked grant in UpdateFailed.
             raise
         except Exception as err:
             _LOGGER.exception("Unexpected critical error in async_update_data: %s", err)

@@ -1,44 +1,16 @@
 #!/usr/bin/env python3
 """Regression guard: the integration must never reload on OAuth token writes.
 
-Background
-----------
-Home Assistant fires config-entry update listeners on ANY change to the entry.
-``OAuth2Session.async_ensure_token_valid()`` persists each refreshed token via
-``async_update_entry()`` (``helpers/config_entry_oauth2_flow.py`` ->
-``config_entries._async_save_and_notify`` -> every ``update_listener``), and
-WHOOP access tokens live one hour.
+Home Assistant fires config-entry update listeners on ANY entry change,
+including the hourly OAuth token write, so an unconditional ``async_reload()``
+in that listener rebuilt this integration ~24x/day. Core owns reloading now:
+``WhoopOptionsFlowHandler`` subclasses ``OptionsFlowWithReload``, which reloads
+only when the options actually changed. The two must never coexist - core
+raises ``ValueError`` if both are present.
 
-This integration used to register ``async_options_updated`` with
-``entry.add_update_listener()`` and call ``async_reload()`` unconditionally, so
-it tore itself down and rebuilt ~24x/day - once per token refresh. Observed in
-production: 24 reloads on 2026-08-03, 20 more overnight on 2026-08-04/05, each
-a ~0.45s gap in every ``sensor.whoop_*`` history. Each reload also costs six
-extra API calls (``async_config_entry_first_refresh``) and, because
-``ConfigEntries.async_reload()`` calls ``_abort_reauth_flows()``
-(``config_entries.py:2469``), silently aborts any reauth the user has open in a
-browser tab when it lands.
-
-The fix removes the update listener entirely and lets core handle reloading:
-``WhoopOptionsFlowHandler`` subclasses ``OptionsFlowWithReload``, so
-``OptionsFlowManager.async_finish_flow`` (``config_entries.py:3940-3946``)
-reloads only when ``async_update_entry`` reports the options actually changed.
-
-The two must never coexist: core raises ``ValueError`` when an update listener
-is registered alongside ``OptionsFlowWithReload`` (``config_entries.py:3934``),
-and pairing an update listener with ``async_update_reload_and_abort`` - which
-the reauth path uses - breaks in HA 2026.12 (``config_entries.py:3561``).
-
-Why these are structural assertions
------------------------------------
-After the fix there is no custom reload logic left to exercise - the decision
-lives in HA core. What can still regress is someone re-introducing the listener
-or changing the options-flow base class back. So this parses the real source
-with ``ast`` and asserts on it. That needs no imports, which means no stubbing
-of ``homeassistant``/``aiohttp``, and unlike a behavioural test against fakes it
-cannot pass vacuously.
-
-Run with plain CPython, no dependencies::
+No custom reload logic is left to exercise, so these are structural assertions
+parsed from the source with ``ast`` - no Home Assistant, no pytest, no
+stubbing, and they cannot pass vacuously::
 
     python3 tests/test_options_listener.py
 """

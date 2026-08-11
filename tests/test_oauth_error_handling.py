@@ -1,28 +1,14 @@
 #!/usr/bin/env python3
 """Guards for OAuth 401 recovery and error classification.
 
-Background
-----------
-WHOOP has been observed returning 401 for an access token that Home Assistant
-still considered valid (`expires_at` in the future). Five such outages were
-recorded 2026-07-30 .. 08-10, lasting 6-27 hours each.
+WHOOP returns 401 for access tokens that Home Assistant still considers valid.
+Because core stops the coordinator permanently on ConfigEntryAuthFailed, the
+integration forces one token refresh and retries for AUTH_RETRY_WINDOW before
+escalating to reauth. These guards pin the parts of that which are easy to
+undo by accident.
 
-They lasted hours because of how the failure was classified. Core only re-arms
-the coordinator's poll timer `if not auth_failed`
-(helpers/update_coordinator.py), so raising ConfigEntryAuthFailed stops polling
-*permanently* - the integration cannot recover on its own and waits for a human.
-Yet two of those five outages were healed with no browser consent at all (one by
-an HA restart, one by `reload_config_entry`), proving the refresh grant was alive
-the whole time and a refresh was all that was needed.
-
-So the integration now forces one token refresh, retries for AUTH_RETRY_WINDOW,
-and only then escalates to reauth.
-
-These are structural assertions, parsed from the real source with `ast`. They
-need no Home Assistant, no pytest and no stubbing, and unlike a behavioural test
-against fakes they cannot pass vacuously.
-
-Run with plain CPython, no dependencies::
+Structural assertions parsed from the source with `ast` - no Home Assistant, no
+pytest, no stubbing, and they cannot pass vacuously::
 
     python3 tests/test_oauth_error_handling.py
 """
@@ -113,15 +99,7 @@ def _handler_order(func: ast.AST) -> list[set[str]]:
 # Tests
 # --------------------------------------------------------------------------
 def test_unauthorized_is_neither_update_failed_nor_auth_failed() -> None:
-    """The single most breakable invariant in this design.
-
-    Subclass UpdateFailed -> the per-endpoint `except UpdateFailed: return None`
-    guards in api.py swallow it, async_update_data never sees the 401, and the
-    integration silently serves empty data forever.
-
-    Subclass ConfigEntryAuthFailed -> core stops the coordinator permanently on
-    the first 401 and we are back to multi-hour outages needing a human.
-    """
+    """The most breakable invariant here: both wrong bases fail silently."""
     cls = _find(_parse(API_PY), "WhoopUnauthorized", (ast.ClassDef,))
     assert cls is not None, "WhoopUnauthorized not found in api.py"
 
@@ -151,14 +129,7 @@ def test_api_maps_401_to_unauthorized_not_auth_failed() -> None:
 
 
 def test_api_does_not_force_token_refresh() -> None:
-    """The retry must live in async_update_data, never in api.py.
-
-    async_update_data fires six requests through asyncio.gather, so a dead token
-    yields six simultaneous 401s. Forcing a refresh per-request would present
-    the same rotating refresh token six times concurrently - textbook
-    reuse-detection input, which could turn a recoverable fault into a genuinely
-    revoked grant.
-    """
+    """Retry belongs in async_update_data: gather issues six requests at once."""
     called = _called_names(_parse(API_PY))
     for forbidden in ("async_update_entry", "_invalidate_access_token",
                       "async_ensure_token_valid"):
@@ -170,12 +141,7 @@ def test_api_does_not_force_token_refresh() -> None:
 
 
 def test_invalidate_rebuilds_the_token_dict() -> None:
-    """Mutating the nested token dict in place silently persists nothing.
-
-    async_update_entry() bails out on `entry.data != data`; an in-place edit
-    compares equal, so the change is never saved and the next cycle would not
-    refresh.
-    """
+    """An in-place edit compares equal to the stored data and saves nothing."""
     func = _func(_parse(INIT_PY), "_invalidate_access_token")
     assert func is not None, "_invalidate_access_token not found in __init__.py"
 
@@ -199,13 +165,7 @@ def test_invalidate_rebuilds_the_token_dict() -> None:
 
 
 def test_oauth_token_request_error_reaches_core() -> None:
-    """D1: the blanket `except Exception` must not swallow OAuth token errors.
-
-    OAuth2TokenRequestError subclasses ClientResponseError, not IntegrationError,
-    so it is neither ConfigEntryAuthFailed nor UpdateFailed. If the blanket
-    handler catches it, a genuinely revoked grant becomes an UpdateFailed - the
-    coordinator retries forever and NEVER prompts for reauth.
-    """
+    """A revoked grant must reach core, not be buried in UpdateFailed."""
     func = _func(_parse(INIT_PY), "async_update_data")
     assert func is not None, "async_update_data not found"
 
@@ -230,12 +190,7 @@ def test_oauth_token_request_error_reaches_core() -> None:
 
 
 def test_transient_setup_failures_are_not_auth_failures() -> None:
-    """D2: a network blip must not demand browser consent.
-
-    _token_request only wraps ClientResponseError, so raw network errors arrive
-    unwrapped - hence ClientError/TimeoutError must be caught explicitly.
-    ConfigEntryNotReady retries with backoff; ConfigEntryAuthFailed nags the user.
-    """
+    """A network blip must retry with backoff, not demand browser consent."""
     func = _func(_parse(INIT_PY), "async_setup_entry")
     assert func is not None, "async_setup_entry not found"
 
